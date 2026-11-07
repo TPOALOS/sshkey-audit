@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sshkey-audit"
+version = "1.1.0"
+description = "Read-only audit of ~/.ssh: keys without passphrase, weak keys, few KDF rounds, loose permissions, known_hosts. JSON output."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "TPOALOS"}]
+keywords = ["ssh", "ssh-keys", "openssh", "hardening"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+]
+
+[project.urls]
+Homepage = "https://github.com/TPOALOS/sshkey-audit"
+
+[project.scripts]
+sshkey-audit = "sshkey_audit:main"
+
+[tool.setuptools]
+py-modules = ["sshkey_audit"]

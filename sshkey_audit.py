@@ -11,13 +11,15 @@ import argparse
 import base64
 import binascii
 import hashlib
+import json
 import os
 import re
+import shlex
 import stat
 import struct
 import sys
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 SEV = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "INFO": 3}
 PEM = re.compile(r"-----BEGIN ([A-Z ]*)PRIVATE KEY-----(.*?)-----END [A-Z ]*PRIVATE KEY-----", re.S)
 KEY_TYPES = ("ssh-rsa", "ssh-dss", "ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384",
@@ -60,8 +62,8 @@ def parse_public_blob(blob):
     return ktype, None
 
 
-def parse_openssh_private(body):
-    """Parse an openssh-key-v1 body; return (cipher, public_blob)."""
+def parse_openssh_private_ex(body):
+    """Parse an openssh-key-v1 body; return (cipher, kdf, bcrypt_rounds_or_None, public_blob)."""
     try:
         data = base64.b64decode("".join(body.split()), validate=True)
     except (binascii.Error, ValueError) as exc:
@@ -71,8 +73,8 @@ def parse_openssh_private(body):
         raise KeyError_("not an openssh-key-v1 file")
     off = len(magic)
     cipher, off = read_string(data, off)
-    _kdf, off = read_string(data, off)
-    _opts, off = read_string(data, off)
+    kdf, off = read_string(data, off)
+    opts, off = read_string(data, off)
     if off + 4 > len(data):
         raise KeyError_("truncated data")
     (count,) = struct.unpack(">I", data[off:off + 4])
@@ -80,7 +82,21 @@ def parse_openssh_private(body):
     if count < 1:
         raise KeyError_("no keys in file")
     pub, _ = read_string(data, off)
-    return cipher.decode("ascii", "replace"), pub
+    rounds = None
+    if kdf == b"bcrypt":
+        try:
+            _salt, o = read_string(opts, 0)
+            if o + 4 <= len(opts):
+                (rounds,) = struct.unpack(">I", opts[o:o + 4])
+        except KeyError_:
+            rounds = None
+    return cipher.decode("ascii", "replace"), kdf.decode("ascii", "replace"), rounds, pub
+
+
+def parse_openssh_private(body):
+    """Parse an openssh-key-v1 body; return (cipher, public_blob)."""
+    cipher, _kdf, _rounds, pub = parse_openssh_private_ex(body)
+    return cipher, pub
 
 
 def strength_findings(ktype, bits, where, add):
@@ -100,10 +116,10 @@ def audit_private(path, text, mode):
     m = PEM.search(text)
     label, body = m.group(1).strip(), m.group(2)
     if mode & 0o077:
-        add("HIGH", "private-key-permissions", "private key is accessible by other users (%04o)" % mode, "chmod 600 %s" % path)
+        add("HIGH", "private-key-permissions", "private key is accessible by other users (%04o)" % mode, "chmod 600 %s" % shlex.quote(path))
     if label == "OPENSSH":
         try:
-            cipher, pub = parse_openssh_private(body)
+            cipher, _kdf, rounds, pub = parse_openssh_private_ex(body)
             ktype, bits = parse_public_blob(pub)
         except KeyError_ as exc:
             add("INFO", "unparsed", "could not parse OpenSSH key (%s)" % exc)
@@ -112,15 +128,18 @@ def audit_private(path, text, mode):
         desc = "%s %s" % (ktype, ("%d-bit" % bits) if bits else "")
         if cipher == "none":
             add("HIGH", "no-passphrase", "private key (%s, %s) has no passphrase" % (desc.strip(), fp),
-                "add one: ssh-keygen -p -f %s" % path)
+                "add one: ssh-keygen -p -f %s" % shlex.quote(path))
+        if cipher != "none" and rounds is not None and rounds < 16:
+            add("LOW", "few-kdf-rounds", "passphrase uses only %d bcrypt round(s) (%s), so guessing it is cheap" % (rounds, fp),
+                "re-encrypt with more rounds: ssh-keygen -p -a 100 -f %s" % shlex.quote(path))
         strength_findings(ktype, bits, "%s (%s)" % (desc.strip(), fp), add)
     else:
         encrypted = "ENCRYPTED" in label or "Proc-Type: 4,ENCRYPTED" in body
         if not encrypted:
             add("HIGH", "no-passphrase", "private key (%s format) has no passphrase" % (label or "PKCS8"),
-                "add one: ssh-keygen -p -f %s" % path)
+                "add one: ssh-keygen -p -f %s" % shlex.quote(path))
         if label in ("RSA", "DSA", "EC"):
-            add("LOW", "legacy-format", "key uses the legacy PEM format", "convert: ssh-keygen -p -o -f %s" % path)
+            add("LOW", "legacy-format", "key uses the legacy PEM format", "convert: ssh-keygen -p -o -f %s" % shlex.quote(path))
     return out
 
 
@@ -171,6 +190,29 @@ def audit_public_lines(text, is_authorized):
     return out
 
 
+def audit_known_hosts(text):
+    """Weak host keys in known_hosts (host names may be hashed or plain; they are never printed)."""
+    out = []
+    for no, line in enumerate(text.splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        parts = line.split()
+        if parts and parts[0].startswith("@"):  # @cert-authority / @revoked markers
+            parts = parts[1:]
+        parsed = parse_key_line(" ".join(parts[1:])) if len(parts) >= 3 else None
+        if not parsed:
+            continue
+        try:
+            ktype, bits = parse_public_blob(parsed[2])
+        except KeyError_:
+            continue
+        tmp = []
+        strength_findings(ktype, bits, "host key %s" % fingerprint(parsed[2]), lambda sv, r, m, f="": tmp.append((sv, r, m, f)))
+        for sv, r, m, f in tmp:
+            out.append((sv, r, m, f, no))
+    return out
+
+
 def audit_path(path):
     """Return list of (severity, rule, message, fix, lineno) for one file."""
     out = []
@@ -192,11 +234,13 @@ def audit_path(path):
         out += audit_public_lines(text, True)
         if mode & 0o022:
             out.append(("HIGH", "authorized-keys-writable", "authorized_keys is writable by others (%04o)" % mode,
-                        "chmod 600 %s" % path, None))
+                        "chmod 600 %s" % shlex.quote(path), None))
     elif name.endswith(".pub"):
         out += audit_public_lines(text, False)
+    elif name == "known_hosts" or name == "ssh_known_hosts":
+        out += audit_known_hosts(text)
     elif name == "config" and mode & 0o022:
-        out.append(("HIGH", "config-writable", "ssh config is writable by others (%04o)" % mode, "chmod 600 %s" % path, None))
+        out.append(("HIGH", "config-writable", "ssh config is writable by others (%04o)" % mode, "chmod 600 %s" % shlex.quote(path), None))
     return out
 
 
@@ -208,7 +252,7 @@ def audit_dir(path):
         return out
     if os.path.basename(os.path.abspath(path)) == ".ssh" and mode & 0o077:
         out.append((path, ("MEDIUM", "ssh-dir-permissions", ".ssh directory is accessible by others (%04o)" % mode,
-                           "chmod 700 %s" % path, None)))
+                           "chmod 700 %s" % shlex.quote(path), None)))
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
         if os.path.isfile(full) and not os.path.islink(full):
@@ -219,6 +263,7 @@ def audit_dir(path):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Audit SSH keys (read-only; key material never printed).")
     ap.add_argument("paths", nargs="*", help="files or directories (default: ~/.ssh)")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--version", action="version", version=__version__)
     args = ap.parse_args(argv)
     paths = args.paths or [os.path.expanduser("~/.ssh")]
@@ -228,13 +273,16 @@ def main(argv=None):
             print("sshkey-audit: no such path: %s" % p, file=sys.stderr)
             return 2
         results += audit_dir(p) if os.path.isdir(p) else [(p, f) for f in audit_path(p)]
-    count = 0
-    for path, (sev, rule, msg, fix, no) in sorted(results, key=lambda r: (SEV[r[1][0]], r[0])):
-        print("%-6s %-24s %s%s: %s%s" % (sev, rule, path, ":%d" % no if no else "", msg, "\n         fix: " + fix if fix else ""))
-        count += sev != "INFO"
+    ordered = sorted(results, key=lambda r: (SEV[r[1][0]], r[0]))
+    count = sum(1 for _, f in ordered if f[0] != "INFO")
+    if args.json:
+        print(json.dumps([{"severity": f[0], "rule": f[1], "path": path, "line": f[4], "message": f[2], "fix": f[3]}
+                          for path, f in ordered], indent=2))
+    else:
+        for path, (sev, rule, msg, fix, no) in ordered:
+            print("%-6s %-24s %s%s: %s%s" % (sev, rule, path, ":%d" % no if no else "", msg, "\n         fix: " + fix if fix else ""))
     print("sshkey-audit: %d finding(s)" % count, file=sys.stderr)
     return 1 if count else 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

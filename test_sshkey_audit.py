@@ -1,4 +1,7 @@
 import base64
+import contextlib
+import io
+import json
 import os
 import struct
 import tempfile
@@ -181,6 +184,128 @@ class DirAndCliTests(Base):
         os.chmod(self.dir, 0o700)
         self.write("authorized_keys", pub_line(ed_blob()) + "\n")
         self.assertEqual(ska.main([self.dir]), 0)
+
+
+def encrypted_private(pub_blob, rounds=None):
+    """openssh-key-v1 with a bcrypt-protected body; rounds=None means no KDF options at all."""
+    opts = s(b"") if rounds is None else s(s(b"S" * 16) + struct.pack(">I", rounds))
+    body = b"openssh-key-v1\x00" + s(b"aes256-ctr") + s(b"bcrypt") + opts + struct.pack(">I", 1) + s(pub_blob) + s(b"\x00" * 64)
+    b64 = base64.b64encode(body).decode()
+    lines = [b64[i:i + 70] for i in range(0, len(b64), 70)]
+    return "\n".join(["-----BEGIN " + "OPENSSH PRIVATE KEY-----"] + lines + ["-----END " + "OPENSSH PRIVATE KEY-----", ""])
+
+
+class KdfRoundsTests(Base):
+    def test_parse_rounds(self):
+        body = encrypted_private(ed_blob(), 16).split("-----")[2]
+        self.assertEqual(ska.parse_openssh_private_ex(body)[:3], ("aes256-ctr", "bcrypt", 16))
+
+    def test_old_two_value_api_unchanged(self):
+        body = encrypted_private(ed_blob(), 16).split("-----")[2]
+        self.assertEqual(ska.parse_openssh_private(body)[0], "aes256-ctr")
+
+    def test_few_rounds_flagged(self):
+        p = self.write("id_a", encrypted_private(ed_blob(), 2))
+        self.assertIn(("LOW", "few-kdf-rounds"), self.rules(p))
+
+    def test_default_or_more_rounds_ok(self):
+        for rounds in (16, 100):
+            p = self.write("id_b%d" % rounds, encrypted_private(ed_blob(), rounds))
+            self.assertEqual(self.rules(p), set(), rounds)
+
+    def test_unknown_rounds_not_flagged(self):
+        p = self.write("id_c", encrypted_private(ed_blob(), None))
+        self.assertEqual(self.rules(p), set())
+
+    def test_unencrypted_key_has_no_rounds_finding(self):
+        p = self.write("id_d", openssh_private(ed_blob()))
+        self.assertNotIn("few-kdf-rounds", {r for _, r in self.rules(p)})
+
+    def test_fix_command_mentions_more_rounds(self):
+        p = self.write("id_e", encrypted_private(ed_blob(), 1))
+        fix = [f[3] for f in ska.audit_path(p) if f[1] == "few-kdf-rounds"][0]
+        self.assertIn("-a 100", fix)
+
+
+class KnownHostsTests(Base):
+    def test_weak_host_keys_flagged(self):
+        text = "\n".join([
+            "example.org " + pub_line(rsa_blob(1024), "").strip(),
+            "|1|c2FsdA==|aGFzaA== " + pub_line(dsa_blob(), "").strip(),
+            "@cert-authority *.example.org " + pub_line(rsa_blob(2048), "").strip(),
+            "good.example " + pub_line(ed_blob(), "").strip(), ""])
+        p = self.write("known_hosts", text, 0o644)
+        found = sorted((f[1], f[4]) for f in ska.audit_path(p))
+        self.assertEqual(found, [("dsa-key", 2), ("short-rsa", 3), ("weak-rsa", 1)])
+
+    def test_host_names_never_printed(self):
+        p = self.write("known_hosts", "secret-host.internal " + pub_line(rsa_blob(1024), "").strip() + "\n", 0o644)
+        for f in ska.audit_path(p):
+            self.assertNotIn("secret-host", " ".join(str(x) for x in f))
+
+    def test_comments_blank_and_garbage_ignored(self):
+        p = self.write("known_hosts", "# c\n\nthis is not a key line\nh ssh-rsa !!!notbase64!!!\n", 0o644)
+        self.assertEqual(ska.audit_path(p), [])
+
+    def test_system_wide_file_name(self):
+        p = self.write("ssh_known_hosts", "h " + pub_line(dsa_blob(), "").strip() + "\n", 0o644)
+        self.assertIn(("HIGH", "dsa-key"), self.rules(p))
+
+
+class QuotingTests(unittest.TestCase):
+    def test_fix_commands_quote_hostile_paths(self):
+        with tempfile.TemporaryDirectory() as d:
+            ssh = os.path.join(d, "$(touch pwned) dir", ".ssh")
+            os.makedirs(ssh, mode=0o700)
+            key = os.path.join(ssh, "id_rsa")
+            with open(key, "w") as fh:
+                fh.write(openssh_private(ed_blob()))
+            os.chmod(key, 0o644)
+            fixes = [f[3] for f in ska.audit_path(key)]
+        self.assertTrue(fixes)
+        for fix in fixes:
+            self.assertIn("'", fix)
+            self.assertNotIn("(touch pwned) dir/.ssh/id_rsa ", fix + " ")  # the whole path sits inside quotes
+            self.assertTrue(fix.count("'") >= 2)
+
+
+def run_main(*argv):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = ska.main(list(argv))
+    return code, out.getvalue(), err.getvalue()
+
+
+class JsonTests(Base):
+    def test_json_output(self):
+        self.write("id_rsa", openssh_private(rsa_blob(1024)), 0o644)
+        code, out, _ = run_main(self.dir, "--json")
+        data = json.loads(out)
+        self.assertEqual(code, 1)
+        self.assertEqual({d["rule"] for d in data}, {"no-passphrase", "private-key-permissions", "weak-rsa"})
+        self.assertEqual(set(data[0]), {"severity", "rule", "path", "line", "message", "fix"})
+        self.assertEqual(data[0]["severity"], "HIGH")
+
+    def test_json_never_contains_key_material(self):
+        text = openssh_private(ed_blob())
+        self.write("id_ed", text, 0o600)
+        _, out, _ = run_main(self.dir, "--json")
+        body = "".join(text.splitlines()[1:-2])
+        self.assertNotIn(body[:40], out)
+
+    def test_json_clean(self):
+        self.write("id_ok", encrypted_private(ed_blob(), 16))
+        code, out, _ = run_main(self.dir, "--json")
+        self.assertEqual((code, json.loads(out)), (0, []))
+
+    def test_info_items_do_not_fail(self):
+        self.write("authorized_keys", pub_line(ed_blob()) + "\n")
+        code, out, _ = run_main(self.dir, "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual({d["severity"] for d in json.loads(out)}, {"INFO"})
+
+    def test_missing_path(self):
+        self.assertEqual(run_main("/nonexistent/path")[0], 2)
 
 
 if __name__ == "__main__":
