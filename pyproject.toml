@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sshkey-audit"
-version = "1.1.0"
+version = "1.1.1"
 description = "Read-only audit of ~/.ssh: keys without passphrase, weak keys, few KDF rounds, loose permissions, known_hosts. JSON output."
 readme = "README.md"
 requires-python = ">=3.9"

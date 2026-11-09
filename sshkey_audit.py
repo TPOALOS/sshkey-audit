@@ -19,7 +19,7 @@ import stat
 import struct
 import sys
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 SEV = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "INFO": 3}
 PEM = re.compile(r"-----BEGIN ([A-Z ]*)PRIVATE KEY-----(.*?)-----END [A-Z ]*PRIVATE KEY-----", re.S)
 KEY_TYPES = ("ssh-rsa", "ssh-dss", "ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384",
@@ -28,6 +28,14 @@ KEY_TYPES = ("ssh-rsa", "ssh-dss", "ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-
 
 class KeyError_(ValueError):
     pass
+
+
+def safe_quote(path):
+    """Shell-quote ``path``; names with a newline or other control character get a harmless placeholder because such a
+    name could split a pasted command into two."""
+    if any(ord(c) < 32 or ord(c) == 127 for c in path):
+        return "'FILE-NAME-HAS-CONTROL-CHARACTERS'"
+    return shlex.quote(path)
 
 
 def read_string(buf, off):
@@ -116,7 +124,7 @@ def audit_private(path, text, mode):
     m = PEM.search(text)
     label, body = m.group(1).strip(), m.group(2)
     if mode & 0o077:
-        add("HIGH", "private-key-permissions", "private key is accessible by other users (%04o)" % mode, "chmod 600 %s" % shlex.quote(path))
+        add("HIGH", "private-key-permissions", "private key is accessible by other users (%04o)" % mode, "chmod 600 %s" % safe_quote(path))
     if label == "OPENSSH":
         try:
             cipher, _kdf, rounds, pub = parse_openssh_private_ex(body)
@@ -128,18 +136,18 @@ def audit_private(path, text, mode):
         desc = "%s %s" % (ktype, ("%d-bit" % bits) if bits else "")
         if cipher == "none":
             add("HIGH", "no-passphrase", "private key (%s, %s) has no passphrase" % (desc.strip(), fp),
-                "add one: ssh-keygen -p -f %s" % shlex.quote(path))
+                "add one: ssh-keygen -p -f %s" % safe_quote(path))
         if cipher != "none" and rounds is not None and rounds < 16:
             add("LOW", "few-kdf-rounds", "passphrase uses only %d bcrypt round(s) (%s), so guessing it is cheap" % (rounds, fp),
-                "re-encrypt with more rounds: ssh-keygen -p -a 100 -f %s" % shlex.quote(path))
+                "re-encrypt with more rounds: ssh-keygen -p -a 100 -f %s" % safe_quote(path))
         strength_findings(ktype, bits, "%s (%s)" % (desc.strip(), fp), add)
     else:
         encrypted = "ENCRYPTED" in label or "Proc-Type: 4,ENCRYPTED" in body
         if not encrypted:
             add("HIGH", "no-passphrase", "private key (%s format) has no passphrase" % (label or "PKCS8"),
-                "add one: ssh-keygen -p -f %s" % shlex.quote(path))
+                "add one: ssh-keygen -p -f %s" % safe_quote(path))
         if label in ("RSA", "DSA", "EC"):
-            add("LOW", "legacy-format", "key uses the legacy PEM format", "convert: ssh-keygen -p -o -f %s" % shlex.quote(path))
+            add("LOW", "legacy-format", "key uses the legacy PEM format", "convert: ssh-keygen -p -o -f %s" % safe_quote(path))
     return out
 
 
@@ -234,13 +242,13 @@ def audit_path(path):
         out += audit_public_lines(text, True)
         if mode & 0o022:
             out.append(("HIGH", "authorized-keys-writable", "authorized_keys is writable by others (%04o)" % mode,
-                        "chmod 600 %s" % shlex.quote(path), None))
+                        "chmod 600 %s" % safe_quote(path), None))
     elif name.endswith(".pub"):
         out += audit_public_lines(text, False)
     elif name == "known_hosts" or name == "ssh_known_hosts":
         out += audit_known_hosts(text)
     elif name == "config" and mode & 0o022:
-        out.append(("HIGH", "config-writable", "ssh config is writable by others (%04o)" % mode, "chmod 600 %s" % shlex.quote(path), None))
+        out.append(("HIGH", "config-writable", "ssh config is writable by others (%04o)" % mode, "chmod 600 %s" % safe_quote(path), None))
     return out
 
 
@@ -252,7 +260,7 @@ def audit_dir(path):
         return out
     if os.path.basename(os.path.abspath(path)) == ".ssh" and mode & 0o077:
         out.append((path, ("MEDIUM", "ssh-dir-permissions", ".ssh directory is accessible by others (%04o)" % mode,
-                           "chmod 700 %s" % shlex.quote(path), None)))
+                           "chmod 700 %s" % safe_quote(path), None)))
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
         if os.path.isfile(full) and not os.path.islink(full):

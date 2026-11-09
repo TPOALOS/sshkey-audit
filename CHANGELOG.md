@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.1
+
+- Suggested fix commands no longer contain file names with newlines or other control characters (such a name could split a
+  pasted command into two); a harmless placeholder is shown instead
+
 ## 1.1.0
 
 - New `few-kdf-rounds` check for passphrase-protected OpenSSH keys

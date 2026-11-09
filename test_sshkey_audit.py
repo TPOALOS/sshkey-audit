@@ -269,6 +269,26 @@ class QuotingTests(unittest.TestCase):
             self.assertTrue(fix.count("'") >= 2)
 
 
+class ControlCharacterTests(unittest.TestCase):
+    def test_safe_quote(self):
+        self.assertEqual(ska.safe_quote("/a b/c"), "'/a b/c'")
+        for name in ("/x/evil\nrm -rf ~\n", "/x/tab\t", "/x/cr\r", "/x/\x07"):
+            self.assertEqual(ska.safe_quote(name), "'FILE-NAME-HAS-CONTROL-CHARACTERS'", repr(name))
+
+    def test_every_suggested_command_stays_on_one_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            ssh = os.path.join(d, ".ssh")
+            os.makedirs(ssh, mode=0o755)
+            key = os.path.join(ssh, "id_x\nrm -rf ~\n")
+            with open(key, "w") as fh:
+                fh.write(openssh_private(ed_blob()))
+            os.chmod(key, 0o644)
+            fixes = [f[3] for f in ska.audit_path(key)] + [f[1][3] for f in ska.audit_dir(ssh)]
+        self.assertTrue(fixes)
+        for fix in fixes:
+            self.assertEqual(len((fix or "").splitlines()) <= 1, True, repr(fix))
+
+
 def run_main(*argv):
     out, err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
